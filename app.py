@@ -122,7 +122,7 @@ def execute_query(query, params=None):
     cursor.execute(query, params or ())
     conn.commit()
     conn.close()
-  st.cache_data.clear()  # Invalidate cache on mutations
+  st.cache_data.clear()
 
 
 def init_db():
@@ -236,82 +236,125 @@ def mostra_modal_dettaglio(item_id):
   foto_list = [convert_to_hd_url(u) for u in foto_list if u]
 
   if foto_list:
-    img_key = f"idx_img_{item['id']}"
-    if img_key not in st.session_state:
-      st.session_state[img_key] = 0
+    images_json = json.dumps(foto_list)
+    gallery_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                background-color: transparent;
+                color: #31333F;
+                margin: 0;
+                padding: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+            }}
+            .container {{
+                width: 100%;
+                max-width: 850px;
+                text-align: center;
+            }}
+            .image-box {{
+                position: relative;
+                width: 100%;
+                background: #0e1117;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 480px;
+            }}
+            img {{
+                max-width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+            }}
+            .controls {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: 12px;
+                width: 100%;
+            }}
+            button {{
+                background-color: #ff4b4b;
+                color: white;
+                border: none;
+                padding: 10px 18px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-weight: 600;
+                font-size: 14px;
+                transition: background 0.2s;
+            }}
+            button:hover {{
+                background-color: #ff2b2b;
+            }}
+            .counter {{
+                font-weight: 600;
+                font-size: 15px;
+            }}
+        </style>
+        </head>
+        <body>
 
-    def prev_pic():
-      st.session_state[img_key] = (st.session_state[img_key] - 1) % len(
-          foto_list
-      )
-
-    def next_pic():
-      st.session_state[img_key] = (st.session_state[img_key] + 1) % len(
-          foto_list
-      )
-
-    c_prev, c_info, c_next = st.columns([1.5, 3, 1.5])
-    with c_prev:
-      st.button(
-          "◀ Precedente (←)",
-          key=f"btn_p_{item['id']}",
-          on_click=prev_pic,
-          use_container_width=True,
-      )
-    with c_info:
-      st.markdown(
-          f"<p style='text-align: center; margin-top: 8px;'><b>Foto"
-          f" {st.session_state[img_key] + 1} di {len(foto_list)}</b></p>",
-          unsafe_allow_html=True,
-      )
-    with c_next:
-      st.button(
-          "Successiva ▶ (→)",
-          key=f"btn_n_{item['id']}",
-          on_click=next_pic,
-          use_container_width=True,
-      )
-
-    st.image(foto_list[st.session_state[img_key]], use_container_width=True)
-
-    # --- KEYBOARD SHORTCUT LISTENER (LEFT / RIGHT ARROWS) ---
-    st.components.v1.html(
-        """
-            <div style="display:none;">
-            <script>
-            const topWin = window.top;
-            const topDoc = topWin.document;
-
-            function onKey(e) {
-                // Ignore if user is typing in an input/textarea/select
-                if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-
-                if (e.key === 'ArrowLeft') {
-                    const buttons = Array.from(topDoc.querySelectorAll('button'));
-                    const btnPrev = buttons.find(b => b.innerText.includes('Precedente'));
-                    if (btnPrev) {
-                        e.preventDefault();
-                        btnPrev.click();
-                    }
-                } else if (e.key === 'ArrowRight') {
-                    const buttons = Array.from(topDoc.querySelectorAll('button'));
-                    const btnNext = buttons.find(b => b.innerText.includes('Successiva'));
-                    if (btnNext) {
-                        e.preventDefault();
-                        btnNext.click();
-                    }
-                }
-            }
-
-            topWin.removeEventListener('keydown', topWin._stKeyHandler);
-            topWin._stKeyHandler = onKey;
-            topWin.addEventListener('keydown', topWin._stKeyHandler);
-            topWin.focus();
-            </script>
+        <div class="container">
+            <div class="image-box">
+                <img id="gallery-img" src="{foto_list[0]}" alt="Foto immobile">
             </div>
-            """,
-        height=0,
-    )
+            <div class="controls">
+                <button id="prev-btn">◀ Precedente (←)</button>
+                <span class="counter" id="counter-text">Foto 1 di {len(foto_list)}</span>
+                <button id="next-btn">Successiva ▶ (→)</button>
+            </div>
+        </div>
+
+        <script>
+            const images = {images_json};
+            let currentIndex = 0;
+
+            const imgElement = document.getElementById('gallery-img');
+            const counterElement = document.getElementById('counter-text');
+            const prevBtn = document.getElementById('prev-btn');
+            const nextBtn = document.getElementById('next-btn');
+
+            function updateGallery() {{
+                imgElement.src = images[currentIndex];
+                counterElement.innerText = `Foto ${{currentIndex + 1}} di ${{images.length}}`;
+            }}
+
+            prevBtn.addEventListener('click', () => {{
+                currentIndex = (currentIndex - 1 + images.length) % images.length;
+                updateGallery();
+            }});
+
+            nextBtn.addEventListener('click', () => {{
+                currentIndex = (currentIndex + 1) % images.length;
+                updateGallery();
+            }});
+
+            window.addEventListener('keydown', (e) => {{
+                if (e.key === 'ArrowLeft') {{
+                    e.preventDefault();
+                    currentIndex = (currentIndex - 1 + images.length) % images.length;
+                    updateGallery();
+                }} else if (e.key === 'ArrowRight') {{
+                    e.preventDefault();
+                    currentIndex = (currentIndex + 1) % images.length;
+                    updateGallery();
+                }}
+            }});
+        </script>
+
+        </body>
+        </html>
+        """
+    st.components.v1.html(gallery_html, height=550, scrolling=False)
   else:
     st.info("📷 Nessuna foto disponibile per questo annuncio.")
 
@@ -522,7 +565,6 @@ else:
 
       cols[3].write(item["locali"])
 
-      # --- INLINE STATUS SELECTBOX ---
       curr_status = (
           item["stato"] if item["stato"] in STATI_DISPONIBILI else "in review"
       )
