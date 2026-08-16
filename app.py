@@ -1,12 +1,19 @@
 import json
+import os
 import re
 import sqlite3
 import pandas as pd
 import streamlit as st
 
+# Try importing libsql for Turso cloud DB sync
+try:
+    import libsql_experimental as libsql
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
+
 st.set_page_config(page_title="House Hunter Turin", page_icon="🏠", layout="wide")
 
-DB_FILE = "case.db"
 STATI_DISPONIBILI = ["in review", "saved", "maybe", "discarded"]
 
 if "sort_col" not in st.session_state:
@@ -15,7 +22,27 @@ if "sort_dir" not in st.session_state:
     st.session_state.sort_dir = "DESC"
 
 def get_connection():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    """Checks Streamlit secrets first, then OS environment variables, then falls back to local case.db."""
+    turso_url = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", ""))
+    turso_token = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", ""))
+
+    if HAS_LIBSQL and turso_url and turso_token:
+        return libsql.connect(database=turso_url, auth_token=turso_token)
+    
+    return sqlite3.connect("case.db", check_same_thread=False)
+
+def read_query_df(query, params=None):
+    """Fail-safe SQL execution wrapper compatible with both SQLite and Turso DBs."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if params:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    conn.close()
+    return pd.DataFrame(rows, columns=columns)
 
 def init_db():
     conn = get_connection()
@@ -45,13 +72,8 @@ def init_db():
 init_db()
 
 def convert_to_hd_url(url: str) -> str:
-    """Rimuove miniature e ridimensionamenti restituendo immagini Full HD."""
     if not url: return url
-    
-    # Rimuove parametri query (es. ?width=300)
     clean_url = url.split('?')[0]
-    
-    # Sostituzione dei pattern CDN
     clean_url = re.sub(r'/thumbnails?/', '/images/', clean_url)
     clean_url = re.sub(r'c-\d+x\d+', 'c-1024x768', clean_url)
     clean_url = re.sub(r'_\d+x\d+\.', '_1024x768.', clean_url)
@@ -59,7 +81,6 @@ def convert_to_hd_url(url: str) -> str:
     clean_url = re.sub(r'/shape/\d+x\d+/', '/shape/1024x768/', clean_url)
     clean_url = re.sub(r'-thumb\.', '-large.', clean_url)
     clean_url = re.sub(r'/small/', '/large/', clean_url)
-    
     return clean_url
 
 def batch_update_listing(id_annuncio, voto_danilo, voto_aurelia, stato, note):
@@ -79,12 +100,9 @@ def toggle_sort(column_db_name):
         st.session_state.sort_col = column_db_name
         st.session_state.sort_dir = "DESC"
 
-# --- MODAL POPUP DIALOG CON TASTIERA GLOBALE ED HD ---
 @st.dialog("🏠 Dettaglio Casa", width="large")
 def mostra_modal_dettaglio(item_id):
-    conn = get_connection()
-    df_single = pd.read_sql_query("SELECT * FROM annunci WHERE id = ?", conn, params=[item_id])
-    conn.close()
+    df_single = read_query_df("SELECT * FROM annunci WHERE id = ?", params=[item_id])
 
     if df_single.empty:
         st.error("Immobile non trovato!")
@@ -93,7 +111,6 @@ def mostra_modal_dettaglio(item_id):
     item = df_single.iloc[0]
     st.subheader(item["titolo"])
 
-    # Gestione Galleria Foto
     foto_raw = item.get("foto", "[]")
     foto_list = []
     try:
@@ -102,7 +119,6 @@ def mostra_modal_dettaglio(item_id):
         if isinstance(foto_raw, str) and foto_raw.startswith("http"):
             foto_list = [foto_raw]
 
-    # Converte e pulisce tutte le foto in HD
     foto_list = [convert_to_hd_url(u) for u in foto_list if u]
 
     if foto_list:
@@ -124,10 +140,8 @@ def mostra_modal_dettaglio(item_id):
         with c_next:
             st.button("Successiva ▶ (→)", key=f"btn_n_{item['id']}", on_click=next_pic, use_container_width=True)
 
-        # Mostra l'immagine
         st.image(foto_list[st.session_state[img_key]], use_container_width=True)
 
-        # 🎯 FIX DEFINITIVO PER LA TASTIERA (Inietta l'ascoltatore globale nella finestra principale)
         st.components.v1.html(
             f"""
             <script>
@@ -164,7 +178,6 @@ def mostra_modal_dettaglio(item_id):
     st.markdown(f"🔗 **[Apri scheda originale su Immobiliare.it]({item['url']})**")
     st.divider()
 
-    # Form Voti / Stato / Note
     st.markdown("### ✏️ Voti, Stato e Note")
     col_d, col_a, col_s = st.columns(3)
 
@@ -197,9 +210,6 @@ show_status = st.sidebar.multiselect(
 
 search_term = st.sidebar.text_input("🔍 Cerca nel Titolo / Via", "")
 
-# --- DATA FETCH ---
-conn = get_connection()
-
 if show_status:
     query_stati = show_status.copy()
     if "in review" in query_stati: query_stati.append("nuovo")
@@ -214,11 +224,9 @@ if show_status:
         WHERE stato IN ({placeholders})
         ORDER BY {sort_column} {sort_direction}
     """
-    df = pd.read_sql_query(query, conn, params=query_stati)
+    df = read_query_df(query, params=query_stati)
 else:
     df = pd.DataFrame()
-
-conn.close()
 
 if not df.empty:
     df["stato"] = df["stato"].replace({"nuovo": "in review", "salvato": "saved", "scartato": "discarded"})

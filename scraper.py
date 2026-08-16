@@ -1,9 +1,17 @@
 import json
+import os
 import re
 import sqlite3
 import time
 from bs4 import BeautifulSoup
 from DrissionPage import ChromiumPage, ChromiumOptions
+
+# Try importing libsql for Turso cloud DB sync
+try:
+    import libsql_experimental as libsql
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
 
 MAX_PAGINE = 50
 
@@ -11,8 +19,20 @@ RICERCHE = {
     "Coppia": "https://www.immobiliare.it/vendita-case/torino/?prezzoMassimo=340000&superficieMinima=80&localiMinimo=3&stato=6&balconeOterrazzo=1&tipoProprieta=1&noAste=1&classeEnergetica=8&idMZona[0]=194&idMZona[1]=181&idMZona[2]=173&idMZona[3]=174&idMZona[4]=172&idMZona[5]=177&idMZona[6]=178&idMZona[7]=183&idQuartiere[0]=682&idQuartiere[1]=667&idQuartiere[2]=663"
 }
 
+def get_connection():
+    """Connects to Turso cloud DB if environment variables exist, else falls back to local SQLite."""
+    turso_url = os.getenv("TURSO_URL", "")
+    turso_token = os.getenv("TURSO_TOKEN", "")
+
+    if HAS_LIBSQL and turso_url and turso_token:
+        print("🌐 Connecting to Turso Cloud Database...")
+        return libsql.connect(database=turso_url, auth_token=turso_token)
+    
+    print("📁 Connecting to local SQLite database (case.db)...")
+    return sqlite3.connect("case.db")
+
 def init_db():
-    conn = sqlite3.connect("case.db")
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS annunci (
@@ -35,11 +55,11 @@ def init_db():
     ''')
     try:
         cursor.execute("ALTER TABLE annunci ADD COLUMN foto TEXT DEFAULT '[]'")
-    except sqlite3.OperationalError:
+    except Exception:
         pass
         
     conn.commit()
-    return conn
+    conn.close()
 
 def parse_digits(val):
     if not val or val == "N/D":
@@ -48,22 +68,18 @@ def parse_digits(val):
     return int(digits) if digits else 0
 
 def convert_to_hd_url(url: str) -> str:
-    if not url: 
+    """Removes thumbnail restrictions and replaces them with Full HD 1024x768 URLs."""
+    if not url:
         return url
-    
-    # Rimuove parametri di ridimensionamento dinamico (es. ?w=360&h=270)
-    url = url.split('?')[0]
-    
-    # Sostituisce i pattern delle miniature di Immobiliare.it / Idealista con Full HD (1024x768 o HD)
-    url = re.sub(r'/thumbnails?/', '/images/', url)
-    url = re.sub(r'c-\d+x\d+', 'c-1024x768', url)
-    url = re.sub(r'_\d+x\d+\.', '_1024x768.', url)
-    url = re.sub(r'/\d+x\d+/', '/1024x768/', url)
-    url = re.sub(r'/shape/\d+x\d+/', '/shape/1024x768/', url)
-    url = re.sub(r'-thumb\.', '-large.', url)
-    url = re.sub(r'/small/', '/large/', url)
-    
-    return url
+    clean_url = url.split('?')[0]
+    clean_url = re.sub(r'/thumbnails?/', '/images/', clean_url)
+    clean_url = re.sub(r'c-\d+x\d+', 'c-1024x768', clean_url)
+    clean_url = re.sub(r'_\d+x\d+\.', '_1024x768.', clean_url)
+    clean_url = re.sub(r'/\d+x\d+/', '/1024x768/', clean_url)
+    clean_url = re.sub(r'/shape/\d+x\d+/', '/shape/1024x768/', clean_url)
+    clean_url = re.sub(r'-thumb\.', '-large.', clean_url)
+    clean_url = re.sub(r'/small/', '/large/', clean_url)
+    return clean_url
 
 def cerca_annunci_nel_json(obj):
     annunci = []
@@ -92,7 +108,8 @@ def gestisci_cookie_banner(page):
         pass
 
 def esegui_scraping():
-    conn = init_db()
+    init_db()
+    conn = get_connection()
     cursor = conn.cursor()
     nuovi_totali = 0
 
@@ -194,7 +211,6 @@ def esegui_scraping():
                     locali = str(prop.get("rooms", "N/D"))
                     link = prop.get("urls", {}).get("express", "") or real_estate.get("url", "")
 
-                    # Estrazione Foto HD
                     foto_urls = []
                     multimedia = prop.get("multimedia", {})
                     photos = multimedia.get("photos", []) if isinstance(multimedia, dict) else []
