@@ -113,9 +113,15 @@ def parse_digits(val):
     return int(digits) if digits else 0
 
 def convert_to_hd_url(url: str) -> str:
+    """Converts low-res thumbnail image URLs (e.g., xxs-c, small, thumb) to 1024x768 HD images."""
     if not url:
         return url
     clean_url = url.split('?')[0]
+    
+    # Replace low-res size suffixes like /xxs-c.jpg, /xxs.jpg, /s-c.jpg, /m-c.jpg
+    clean_url = re.sub(r'/(xxs|xs|s|m)(-c)?\.(jpg|jpeg|webp|png)$', r'/1024x768.\3', clean_url, flags=re.IGNORECASE)
+    
+    # Standard replacement rules
     clean_url = re.sub(r'/thumbnails?/', '/images/', clean_url)
     clean_url = re.sub(r'c-\d+x\d+', 'c-1024x768', clean_url)
     clean_url = re.sub(r'_\d+x\d+\.', '_1024x768.', clean_url)
@@ -123,14 +129,17 @@ def convert_to_hd_url(url: str) -> str:
     clean_url = re.sub(r'/shape/\d+x\d+/', '/shape/1024x768/', clean_url)
     clean_url = re.sub(r'-thumb\.', '-large.', clean_url)
     clean_url = re.sub(r'/small/', '/large/', clean_url)
+    
     return clean_url
 
-def format_full_url(url: str) -> str:
-    if not url:
-        return ""
-    if not url.startswith("http"):
-        return f"https://www.immobiliare.it{url if url.startswith('/') else '/' + url}"
-    return url
+def format_full_url(url: str, listing_id: str = "") -> str:
+    if url:
+        if not url.startswith("http"):
+            return f"https://www.immobiliare.it{url if url.startswith('/') else '/' + url}"
+        return url
+    if listing_id:
+        return f"https://www.immobiliare.it/annunci/{listing_id}/"
+    return ""
 
 def cerca_annunci_nel_json(obj):
     annunci = []
@@ -148,6 +157,31 @@ def cerca_annunci_nel_json(obj):
         for item in obj:
             annunci.extend(cerca_annunci_nel_json(item))
     return annunci
+
+def extract_listing_url(real_estate, listing_id):
+    """Extracts URL from nested json structure with robust fallbacks."""
+    # 1. Try direct properties
+    url = real_estate.get("url") or real_estate.get("seoUrl")
+    if url: return format_full_url(url, listing_id)
+
+    # 2. Try nested properties locations
+    properties = real_estate.get("properties", [{}])
+    if properties and isinstance(properties, list):
+        prop = properties[0]
+        urls_dict = prop.get("urls", {})
+        if isinstance(urls_dict, dict):
+            url = urls_dict.get("express") or urls_dict.get("ita") or urls_dict.get("default")
+            if url: return format_full_url(url, listing_id)
+
+        location = prop.get("location", {})
+        if isinstance(location, dict):
+            loc_urls = location.get("urls", {})
+            if isinstance(loc_urls, dict):
+                url = loc_urls.get("ita") or loc_urls.get("express")
+                if url: return format_full_url(url, listing_id)
+
+    # 3. Fallback direct listing ID constructed URL
+    return format_full_url("", listing_id)
 
 def gestisci_cookie_banner(page):
     try:
@@ -232,7 +266,8 @@ def esegui_scraping():
                                 "title": titolo,
                                 "price": prezzo,
                                 "foto_list": foto_list,
-                                "properties": [{"surface": superficie, "rooms": locali, "urls": {"express": link}}]
+                                "url": format_full_url(link, id_annuncio),
+                                "properties": [{"surface": superficie, "rooms": locali}]
                             }
                         except Exception:
                             pass
@@ -260,8 +295,7 @@ def esegui_scraping():
 
                     locali = str(prop.get("rooms", "N/D"))
                     
-                    raw_link = prop.get("urls", {}).get("express", "") or real_estate.get("url", "")
-                    link = format_full_url(raw_link)
+                    link = extract_listing_url(real_estate, id_annuncio)
 
                     foto_urls = []
                     multimedia = prop.get("multimedia", {})
@@ -284,6 +318,9 @@ def esegui_scraping():
                         (id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, stato) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
                     '''
+                    sql_update_existing = '''
+                        UPDATE annunci SET url = ?, foto = ? WHERE id = ? AND (url IS NULL OR url = '' OR foto LIKE '%xxs%')
+                    '''
                     params_insert = (id_annuncio, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, link, foto_json)
 
                     if isinstance(db, TursoDB):
@@ -293,6 +330,8 @@ def esegui_scraping():
                             nuovi_totali += 1
                             nuovi_pagina += 1
                             print(f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)")
+                        else:
+                            db.execute(sql_update_existing, [link, foto_json, id_annuncio])
                     else:
                         conn = db
                         cursor = conn.cursor()
@@ -303,6 +342,9 @@ def esegui_scraping():
                             nuovi_totali += 1
                             nuovi_pagina += 1
                             print(f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)")
+                        else:
+                            cursor.execute(sql_update_existing, (link, foto_json, id_annuncio))
+                            conn.commit()
 
                 print(f"   ↳ {nuovi_pagina} nuovi annunci inseriti.")
 

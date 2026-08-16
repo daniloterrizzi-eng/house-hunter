@@ -125,16 +125,25 @@ def init_db():
 
 init_db()
 
-def format_full_url(url: str) -> str:
-    if not url:
-        return "#"
-    if not url.startswith("http"):
-        return f"https://www.immobiliare.it{url if url.startswith('/') else '/' + url}"
-    return url
+def format_full_url(url: str, listing_id: str = "") -> str:
+    if url and str(url).strip():
+        clean_url = str(url).strip()
+        if not clean_url.startswith("http"):
+            return f"https://www.immobiliare.it{clean_url if clean_url.startswith('/') else '/' + clean_url}"
+        return clean_url
+    if listing_id:
+        return f"https://www.immobiliare.it/annunci/{listing_id}/"
+    return "#"
 
 def convert_to_hd_url(url: str) -> str:
+    """Converts low-res thumbnail image URLs (e.g., xxs-c, small, thumb) to 1024x768 HD images."""
     if not url: return url
     clean_url = url.split('?')[0]
+    
+    # Replace low-res size suffixes like /xxs-c.jpg, /xxs.jpg, /s-c.jpg, /m-c.jpg
+    clean_url = re.sub(r'/(xxs|xs|s|m)(-c)?\.(jpg|jpeg|webp|png)$', r'/1024x768.\3', clean_url, flags=re.IGNORECASE)
+    
+    # Standard replacement rules
     clean_url = re.sub(r'/thumbnails?/', '/images/', clean_url)
     clean_url = re.sub(r'c-\d+x\d+', 'c-1024x768', clean_url)
     clean_url = re.sub(r'_\d+x\d+\.', '_1024x768.', clean_url)
@@ -142,6 +151,7 @@ def convert_to_hd_url(url: str) -> str:
     clean_url = re.sub(r'/shape/\d+x\d+/', '/shape/1024x768/', clean_url)
     clean_url = re.sub(r'-thumb\.', '-large.', clean_url)
     clean_url = re.sub(r'/small/', '/large/', clean_url)
+    
     return clean_url
 
 def batch_update_listing(id_annuncio, voto_danilo, voto_aurelia, stato, note):
@@ -164,7 +174,7 @@ def mostra_modal_dettaglio(item_id):
         return
 
     item = df_single.iloc[0]
-    item_url = format_full_url(item["url"])
+    item_url = format_full_url(item["url"], item["id"])
 
     st.subheader(item["titolo"])
 
@@ -176,6 +186,7 @@ def mostra_modal_dettaglio(item_id):
         if isinstance(foto_raw, str) and foto_raw.startswith("http"):
             foto_list = [foto_raw]
 
+    # Convert all photos dynamically to HD
     foto_list = [convert_to_hd_url(u) for u in foto_list if u]
 
     if foto_list:
@@ -213,7 +224,7 @@ def mostra_modal_dettaglio(item_id):
                         btnPrev.click();
                     }}
                 }} else if (e.key === 'ArrowRight') {{
-                    const btnNext = topDoc.querySelector('button[key="btn_n_{item['id']}"]');
+                    const btnNext = topDoc.querySelector('button[key="btn_next_{item['id']}"]');
                     if (btnNext) {{
                         e.preventDefault();
                         btnNext.click();
@@ -296,7 +307,7 @@ st.title(f"🏠 House Hunter Turin ({len(df)} immobili)")
 if df.empty:
     st.info("💡 Nessun immobile trovato. Modifica i filtri o esegui lo scraper!")
 else:
-    st.caption("👇 Clicca sulle intestazioni per ordinare. Clicca sul **Titolo** o su **🔗 Link** per aprire la scheda originale su Immobiliare.it.")
+    st.caption("👇 Clicca sulle intestazioni per ordinare. Clicca sul **Titolo** per aprire la scheda originale su Immobiliare.it.")
 
     h_cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
     arrow = "🔽" if st.session_state.sort_dir == "DESC" else "🔼"
@@ -343,8 +354,8 @@ else:
         with st.container(border=True):
             cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
             
-            # Clickable Title Link
-            item_url = format_full_url(item["url"])
+            # Clickable Title Link with Fallback to ID
+            item_url = format_full_url(item["url"], item["id"])
             cols[0].markdown(f"🔗 [{item['titolo']}]({item_url})")
 
             cols[1].write(item["prezzo"])
