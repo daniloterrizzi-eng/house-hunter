@@ -19,7 +19,6 @@ RICERCHE = {
 }
 
 class TursoDB:
-    """HTTP Client for Turso Database (bypasses native C++ / Rust compilation)."""
     def __init__(self, db_url, token):
         self.endpoint = db_url.replace("libsql://", "https://") + "/v2/pipeline"
         self.headers = {
@@ -125,6 +124,13 @@ def convert_to_hd_url(url: str) -> str:
     clean_url = re.sub(r'-thumb\.', '-large.', clean_url)
     clean_url = re.sub(r'/small/', '/large/', clean_url)
     return clean_url
+
+def format_full_url(url: str) -> str:
+    if not url:
+        return ""
+    if not url.startswith("http"):
+        return f"https://www.immobiliare.it{url if url.startswith('/') else '/' + url}"
+    return url
 
 def cerca_annunci_nel_json(obj):
     annunci = []
@@ -253,7 +259,9 @@ def esegui_scraping():
                     superficie = f"{superficie_num}" if superficie_num > 0 else "N/D"
 
                     locali = str(prop.get("rooms", "N/D"))
-                    link = prop.get("urls", {}).get("express", "") or real_estate.get("url", "")
+                    
+                    raw_link = prop.get("urls", {}).get("express", "") or real_estate.get("url", "")
+                    link = format_full_url(raw_link)
 
                     foto_urls = []
                     multimedia = prop.get("multimedia", {})

@@ -6,7 +6,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Default Turso Credentials with Streamlit Secrets & Env Fallbacks
 TURSO_URL = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io"))
 TURSO_TOKEN = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODE2NjcsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.rROVpRRKgMekGE6dSiKoDiPUK9lqU0eLAXTVDO56pXc2fo_Cfwy6rGaaGPIv11uAGSv_dOZ3c_1wNdBtp8eiBQ"))
 
@@ -126,6 +125,13 @@ def init_db():
 
 init_db()
 
+def format_full_url(url: str) -> str:
+    if not url:
+        return "#"
+    if not url.startswith("http"):
+        return f"https://www.immobiliare.it{url if url.startswith('/') else '/' + url}"
+    return url
+
 def convert_to_hd_url(url: str) -> str:
     if not url: return url
     clean_url = url.split('?')[0]
@@ -158,6 +164,8 @@ def mostra_modal_dettaglio(item_id):
         return
 
     item = df_single.iloc[0]
+    item_url = format_full_url(item["url"])
+
     st.subheader(item["titolo"])
 
     foto_raw = item.get("foto", "[]")
@@ -224,7 +232,7 @@ def mostra_modal_dettaglio(item_id):
     else:
         st.info("📷 Nessuna foto disponibile per questo annuncio.")
 
-    st.markdown(f"🔗 **[Apri scheda originale su Immobiliare.it]({item['url']})**")
+    st.markdown(f"🔗 **[Apri scheda originale su Immobiliare.it]({item_url})**")
     st.divider()
 
     st.markdown("### ✏️ Voti, Stato e Note")
@@ -288,7 +296,7 @@ st.title(f"🏠 House Hunter Turin ({len(df)} immobili)")
 if df.empty:
     st.info("💡 Nessun immobile trovato. Modifica i filtri o esegui lo scraper!")
 else:
-    st.caption("👇 Clicca sulle intestazioni per ordinare. Clicca su **👁️ Apri** per vedere foto HD e votare.")
+    st.caption("👇 Clicca sulle intestazioni per ordinare. Clicca sul **Titolo** o su **🔗 Link** per aprire la scheda originale su Immobiliare.it.")
 
     h_cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
     arrow = "🔽" if st.session_state.sort_dir == "DESC" else "🔼"
@@ -334,7 +342,11 @@ else:
     for idx, item in df_page.iterrows():
         with st.container(border=True):
             cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
-            cols[0].write(item["titolo"])
+            
+            # Clickable Title Link
+            item_url = format_full_url(item["url"])
+            cols[0].markdown(f"🔗 [{item['titolo']}]({item_url})")
+
             cols[1].write(item["prezzo"])
             
             sup_clean = str(item['superficie']).replace('m²', '').strip()
