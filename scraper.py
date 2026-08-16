@@ -3,15 +3,14 @@ import os
 import re
 import sqlite3
 import time
+import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from DrissionPage import ChromiumPage, ChromiumOptions
 
-# Try importing libsql for Turso cloud DB sync
-try:
-    import libsql_experimental as libsql
-    HAS_LIBSQL = True
-except ImportError:
-    HAS_LIBSQL = False
+# Default Turso Credentials with Environment Variable Overrides
+TURSO_URL = os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io")
+TURSO_TOKEN = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODE2NjcsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.rROVpRRKgMekGE6dSiKoDiPUK9lqU0eLAXTVDO56pXc2fo_Cfwy6rGaaGPIv11uAGSv_dOZ3c_1wNdBtp8eiBQ")
 
 MAX_PAGINE = 50
 
@@ -19,22 +18,68 @@ RICERCHE = {
     "Coppia": "https://www.immobiliare.it/vendita-case/torino/?prezzoMassimo=340000&superficieMinima=80&localiMinimo=3&stato=6&balconeOterrazzo=1&tipoProprieta=1&noAste=1&classeEnergetica=8&idMZona[0]=194&idMZona[1]=181&idMZona[2]=173&idMZona[3]=174&idMZona[4]=172&idMZona[5]=177&idMZona[6]=178&idMZona[7]=183&idQuartiere[0]=682&idQuartiere[1]=667&idQuartiere[2]=663"
 }
 
-def get_connection():
-    """Connects to Turso cloud DB if environment variables exist, else falls back to local SQLite."""
-    turso_url = os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io")
-    turso_token = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODA3MTEsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.LiDuf5yxnhMHZdQ6RZiK7pbruFNMScTfNJeQ2yxT7kDms0TtKrEFR7yTTyTnqf02fDj8VTz-jUoKtXz2B3vrDQ")
+class TursoDB:
+    """HTTP Client for Turso Database (bypasses native C++ / Rust compilation)."""
+    def __init__(self, db_url, token):
+        self.endpoint = db_url.replace("libsql://", "https://") + "/v2/pipeline"
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
 
-    if HAS_LIBSQL and turso_url and turso_token:
-        print("🌐 Connecting to Turso Cloud Database...")
-        return libsql.connect(database=turso_url, auth_token=turso_token)
-    
+    def execute(self, sql, params=None):
+        args = []
+        if params:
+            for p in params:
+                if p is None:
+                    args.append({"type": "null"})
+                elif isinstance(p, int):
+                    args.append({"type": "integer", "value": str(p)})
+                elif isinstance(p, float):
+                    args.append({"type": "float", "value": p})
+                else:
+                    args.append({"type": "text", "value": str(p)})
+
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": args}},
+                {"type": "close"}
+            ]
+        }
+
+        res = requests.post(self.endpoint, json=payload, headers=self.headers)
+        res.raise_for_status()
+        data = res.json()
+
+        result = data["results"][0]["response"]["result"]
+        cols = [col["name"] for col in result.get("cols", [])]
+        rows = []
+        for raw_row in result.get("rows", []):
+            parsed_row = []
+            for cell in raw_row:
+                c_type = cell.get("type")
+                if c_type == "null":
+                    parsed_row.append(None)
+                elif c_type == "integer":
+                    parsed_row.append(int(cell.get("value")))
+                elif c_type == "float":
+                    parsed_row.append(float(cell.get("value")))
+                else:
+                    parsed_row.append(cell.get("value"))
+            rows.append(parsed_row)
+
+        return pd.DataFrame(rows, columns=cols)
+
+def get_db():
+    if TURSO_URL and TURSO_TOKEN and "yourusername" not in TURSO_URL:
+        print("🌐 Connecting to Turso Cloud Database via HTTP...")
+        return TursoDB(TURSO_URL, TURSO_TOKEN)
     print("📁 Connecting to local SQLite database (case.db)...")
     return sqlite3.connect("case.db")
 
 def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
+    db = get_db()
+    sql_create = '''
         CREATE TABLE IF NOT EXISTS annunci (
             id TEXT PRIMARY KEY,
             profilo TEXT,
@@ -52,14 +97,15 @@ def init_db():
             voto_ragazza INTEGER DEFAULT 0,
             data_scoperta TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    try:
-        cursor.execute("ALTER TABLE annunci ADD COLUMN foto TEXT DEFAULT '[]'")
-    except Exception:
-        pass
-        
-    conn.commit()
-    conn.close()
+    '''
+    if isinstance(db, TursoDB):
+        db.execute(sql_create)
+    else:
+        conn = db
+        cursor = conn.cursor()
+        cursor.execute(sql_create)
+        conn.commit()
+        conn.close()
 
 def parse_digits(val):
     if not val or val == "N/D":
@@ -68,7 +114,6 @@ def parse_digits(val):
     return int(digits) if digits else 0
 
 def convert_to_hd_url(url: str) -> str:
-    """Removes thumbnail restrictions and replaces them with Full HD 1024x768 URLs."""
     if not url:
         return url
     clean_url = url.split('?')[0]
@@ -109,8 +154,7 @@ def gestisci_cookie_banner(page):
 
 def esegui_scraping():
     init_db()
-    conn = get_connection()
-    cursor = conn.cursor()
+    db = get_db()
     nuovi_totali = 0
 
     print("🚀 Avvio DrissionPage...")
@@ -226,19 +270,31 @@ def esegui_scraping():
 
                     foto_json = json.dumps(foto_urls)
 
-                    cursor.execute("SELECT id FROM annunci WHERE id = ?", (id_annuncio,))
-                    if not cursor.fetchone():
-                        cursor.execute(
-                            '''
-                            INSERT INTO annunci 
-                            (id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, stato) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
-                            ''',
-                            (id_annuncio, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, link, foto_json)
-                        )
-                        nuovi_totali += 1
-                        nuovi_pagina += 1
-                        print(f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)")
+                    sql_check = "SELECT id FROM annunci WHERE id = ?"
+                    sql_insert = '''
+                        INSERT INTO annunci 
+                        (id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, stato) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
+                    '''
+                    params_insert = (id_annuncio, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, link, foto_json)
+
+                    if isinstance(db, TursoDB):
+                        existing = db.execute(sql_check, [id_annuncio])
+                        if existing.empty:
+                            db.execute(sql_insert, params_insert)
+                            nuovi_totali += 1
+                            nuovi_pagina += 1
+                            print(f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)")
+                    else:
+                        conn = db
+                        cursor = conn.cursor()
+                        cursor.execute(sql_check, (id_annuncio,))
+                        if not cursor.fetchone():
+                            cursor.execute(sql_insert, params_insert)
+                            conn.commit()
+                            nuovi_totali += 1
+                            nuovi_pagina += 1
+                            print(f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)")
 
                 print(f"   ↳ {nuovi_pagina} nuovi annunci inseriti.")
 
@@ -247,8 +303,6 @@ def esegui_scraping():
     except Exception as e:
         print(f"❌ Errore: {e}")
 
-    conn.commit()
-    conn.close()
     return nuovi_totali
 
 if __name__ == "__main__":

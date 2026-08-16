@@ -3,14 +3,12 @@ import os
 import re
 import sqlite3
 import pandas as pd
+import requests
 import streamlit as st
 
-# Try importing libsql for Turso cloud DB sync
-try:
-    import libsql_experimental as libsql
-    HAS_LIBSQL = True
-except ImportError:
-    HAS_LIBSQL = False
+# Default Turso Credentials with Streamlit Secrets & Env Fallbacks
+TURSO_URL = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io"))
+TURSO_TOKEN = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODE2NjcsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.rROVpRRKgMekGE6dSiKoDiPUK9lqU0eLAXTVDO56pXc2fo_Cfwy6rGaaGPIv11uAGSv_dOZ3c_1wNdBtp8eiBQ"))
 
 st.set_page_config(page_title="House Hunter Turin", page_icon="🏠", layout="wide")
 
@@ -21,19 +19,68 @@ if "sort_col" not in st.session_state:
 if "sort_dir" not in st.session_state:
     st.session_state.sort_dir = "DESC"
 
-def get_connection():
-    """Checks Streamlit secrets first, then OS environment variables, then falls back to local case.db."""
-    turso_url = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io"))
-    turso_token = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODA3MTEsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.LiDuf5yxnhMHZdQ6RZiK7pbruFNMScTfNJeQ2yxT7kDms0TtKrEFR7yTTyTnqf02fDj8VTz-jUoKtXz2B3vrDQ"))
+class TursoDB:
+    def __init__(self, db_url, token):
+        self.endpoint = db_url.replace("libsql://", "https://") + "/v2/pipeline"
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
 
-    if HAS_LIBSQL and turso_url and turso_token:
-        return libsql.connect(database=turso_url, auth_token=turso_token)
-    
+    def execute(self, sql, params=None):
+        args = []
+        if params:
+            for p in params:
+                if p is None:
+                    args.append({"type": "null"})
+                elif isinstance(p, int):
+                    args.append({"type": "integer", "value": str(p)})
+                elif isinstance(p, float):
+                    args.append({"type": "float", "value": p})
+                else:
+                    args.append({"type": "text", "value": str(p)})
+
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": sql, "args": args}},
+                {"type": "close"}
+            ]
+        }
+
+        res = requests.post(self.endpoint, json=payload, headers=self.headers)
+        res.raise_for_status()
+        data = res.json()
+
+        result = data["results"][0]["response"]["result"]
+        cols = [col["name"] for col in result.get("cols", [])]
+        rows = []
+        for raw_row in result.get("rows", []):
+            parsed_row = []
+            for cell in raw_row:
+                c_type = cell.get("type")
+                if c_type == "null":
+                    parsed_row.append(None)
+                elif c_type == "integer":
+                    parsed_row.append(int(cell.get("value")))
+                elif c_type == "float":
+                    parsed_row.append(float(cell.get("value")))
+                else:
+                    parsed_row.append(cell.get("value"))
+            rows.append(parsed_row)
+
+        return pd.DataFrame(rows, columns=cols)
+
+def get_db():
+    if TURSO_URL and TURSO_TOKEN and "yourusername" not in TURSO_URL:
+        return TursoDB(TURSO_URL, TURSO_TOKEN)
     return sqlite3.connect("case.db", check_same_thread=False)
 
 def read_query_df(query, params=None):
-    """Fail-safe SQL execution wrapper compatible with both SQLite and Turso DBs."""
-    conn = get_connection()
+    db = get_db()
+    if isinstance(db, TursoDB):
+        return db.execute(query, params)
+    
+    conn = db
     cursor = conn.cursor()
     if params:
         cursor.execute(query, params)
@@ -44,10 +91,19 @@ def read_query_df(query, params=None):
     conn.close()
     return pd.DataFrame(rows, columns=columns)
 
+def execute_query(query, params=None):
+    db = get_db()
+    if isinstance(db, TursoDB):
+        db.execute(query, params)
+    else:
+        conn = db
+        cursor = conn.cursor()
+        cursor.execute(query, params or ())
+        conn.commit()
+        conn.close()
+
 def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
+    sql = '''
         CREATE TABLE IF NOT EXISTS annunci (
             id TEXT PRIMARY KEY,
             profilo TEXT,
@@ -65,9 +121,8 @@ def init_db():
             voto_ragazza INTEGER DEFAULT 0,
             data_scoperta TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
-    conn.commit()
-    conn.close()
+    '''
+    execute_query(sql)
 
 init_db()
 
@@ -84,14 +139,8 @@ def convert_to_hd_url(url: str) -> str:
     return clean_url
 
 def batch_update_listing(id_annuncio, voto_danilo, voto_aurelia, stato, note):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE annunci SET voto_danilo = ?, voto_ragazza = ?, stato = ?, note = ? WHERE id = ?",
-        (voto_danilo, voto_aurelia, stato, note, id_annuncio)
-    )
-    conn.commit()
-    conn.close()
+    sql = "UPDATE annunci SET voto_danilo = ?, voto_ragazza = ?, stato = ?, note = ? WHERE id = ?"
+    execute_query(sql, [voto_danilo, voto_aurelia, stato, note, id_annuncio])
 
 def toggle_sort(column_db_name):
     if st.session_state.sort_col == column_db_name:
