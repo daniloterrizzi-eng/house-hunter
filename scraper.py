@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -8,6 +9,9 @@ import requests
 from bs4 import BeautifulSoup
 from DrissionPage import ChromiumOptions, ChromiumPage
 
+# ==========================================
+# CONFIGURATION & CONSTANTS
+# ==========================================
 TURSO_URL = os.getenv(
     "TURSO_URL",
     "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io",
@@ -20,10 +24,15 @@ TURSO_TOKEN = os.getenv(
 MAX_PAGINE = 50
 
 RICERCHE = {
-    "Coppia": "https://www.immobiliare.it/vendita-case/torino/?prezzoMassimo=340000&superficieMinima=80&localiMinimo=3&stato=6&balconeOterrazzo=1&tipoProprieta=1&noAste=1&classeEnergetica=8&idMZona[0]=194&idMZona[1]=181&idMZona[2]=173&idMZona[3]=174&idMZona[4]=172&idMZona[5]=177&idMZona[6]=178&idMZona[7]=183&idQuartiere[0]=682&idQuartiere[1]=667&idQuartiere[2]=663"
+    "Coppia": (
+        "https://www.immobiliare.it/vendita-case/torino/?prezzoMassimo=340000&superficieMinima=80&localiMinimo=3&stato=6&balconeOterrazzo=1&tipoProprieta=1&noAste=1&classeEnergetica=8&idMZona[0]=194&idMZona[1]=181&idMZona[2]=173&idMZona[3]=174&idMZona[4]=172&idMZona[5]=177&idMZona[6]=178&idMZona[7]=183&idQuartiere[0]=682&idQuartiere[1]=667&idQuartiere[2]=663"
+    )
 }
 
 
+# ==========================================
+# TURSO DB CLASS
+# ==========================================
 class TursoDB:
 
   def __init__(self, db_url, token):
@@ -53,7 +62,9 @@ class TursoDB:
         ]
     }
 
-    res = requests.post(self.endpoint, json=payload, headers=self.headers)
+    res = requests.post(
+        self.endpoint, json=payload, headers=self.headers, timeout=15
+    )
     res.raise_for_status()
     data = res.json()
 
@@ -79,9 +90,7 @@ class TursoDB:
 
 def get_db():
   if TURSO_URL and TURSO_TOKEN and "yourusername" not in TURSO_URL:
-    print("🌐 Connecting to Turso Cloud Database via HTTP...")
     return TursoDB(TURSO_URL, TURSO_TOKEN)
-  print("📁 Connecting to local SQLite database (case.db)...")
   return sqlite3.connect("case.db")
 
 
@@ -127,6 +136,33 @@ def init_db():
     conn.close()
 
 
+def load_db_cache(db) -> dict:
+  print("⚡ Loading database cache into RAM...")
+  sql = "SELECT id, descrizione FROM annunci"
+  cache = {}
+  try:
+    if isinstance(db, TursoDB):
+      df = db.execute(sql)
+      if not df.empty and "id" in df.columns:
+        for _, row in df.iterrows():
+          cache[str(row["id"])] = (
+              str(row["descrizione"]) if row["descrizione"] is not None else ""
+          )
+    else:
+      conn = db if not isinstance(db, str) else sqlite3.connect("case.db")
+      cursor = conn.cursor()
+      cursor.execute(sql)
+      for row in cursor.fetchall():
+        cache[str(row[0])] = str(row[1]) if row[1] is not None else ""
+  except Exception as e:
+    print(f"⚠️ Cache notice: {e}")
+  print(f"✅ RAM Cache ready: {len(cache)} existing records loaded.")
+  return cache
+
+
+# ==========================================
+# PARSERS & HELPERS
+# ==========================================
 def parse_digits(val):
   if not val or val == "N/D":
     return 0
@@ -135,24 +171,18 @@ def parse_digits(val):
 
 
 def convert_to_hd_url(url: str) -> str:
-  """Converts thumbnail and misconfigured image URLs to high-res '/l-c.jpg' format."""
   if not url:
     return url
   clean_url = url.split("?")[0]
-
-  # Direct size replacement to working high-res suffix 'l-c'
   clean_url = re.sub(
       r"/(\d+x\d+|xxs|xs|s|m|l|xl)(-c)?\.(jpg|jpeg|webp|png)$",
       r"/l-c.\3",
       clean_url,
       flags=re.IGNORECASE,
   )
-
-  # Standard fallbacks
   clean_url = re.sub(r"/thumbnails?/", "/images/", clean_url)
   clean_url = re.sub(r"-thumb\.", "-large.", clean_url)
   clean_url = re.sub(r"/small/", "/large/", clean_url)
-
   return clean_url
 
 
@@ -204,14 +234,6 @@ def extract_listing_url(real_estate, listing_id):
       if url:
         return format_full_url(url, listing_id)
 
-    location = prop.get("location", {})
-    if isinstance(location, dict):
-      loc_urls = location.get("urls", {})
-      if isinstance(loc_urls, dict):
-        url = loc_urls.get("ita") or loc_urls.get("express")
-        if url:
-          return format_full_url(url, listing_id)
-
   return format_full_url("", listing_id)
 
 
@@ -222,29 +244,111 @@ def gestisci_cookie_banner(page):
     )
     if btn:
       btn.click()
-      time.sleep(1)
+      time.sleep(0.5)
   except Exception:
     pass
 
 
+# ==========================================
+# BROWSER IN-MEMORY FETCH ENGINE
+# ==========================================
+def fetch_html_via_browser(page, url: str) -> str:
+  """Executes fetch() natively within Chromium page context to bypass Akamai."""
+  js_script = r"""
+        return (async () => {
+            try {
+                const res = await fetch(arguments[0], {
+                    headers: { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
+                });
+                return await res.text();
+            } catch(e) {
+                return '';
+            }
+        })();
+    """
+  return page.run_js(js_script, url) or ""
+
+
+def batch_fetch_descriptions_js(page, listing_ids: list) -> dict:
+  """Concurrently fetches missing listing descriptions inside the Chromium browser console."""
+  if not listing_ids:
+    return {}
+
+  js_script = r"""
+        return (async () => {
+            const ids = JSON.parse(arguments[0]);
+            const promises = ids.map(async (id) => {
+                try {
+                    const res = await fetch(`https://www.immobiliare.it/annunci/${id}/`);
+                    if (!res.ok) return { id, desc: '' };
+                    const html = await res.text();
+                    
+                    const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.*?)<\/script>/s);
+                    if (match && match[1]) {
+                        const data = JSON.parse(match[1]);
+                        const prop = data?.props?.pageProps?.detailData?.realEstate?.properties?.[0];
+                        if (prop && prop.description) {
+                            return { id, desc: prop.description.trim() };
+                        }
+                    }
+                    
+                    const descMatch = html.match(/class="in-readAll[^"]*">(.*?)<\/div>/s) || html.match(/class="in-realEstateDescription__text[^"]*">(.*?)<\/div>/s);
+                    if (descMatch && descMatch[1]) {
+                        return { id, desc: descMatch[1].replace(/<[^>]+>/g, '').trim() };
+                    }
+                } catch (e) {}
+                return { id, desc: '' };
+            });
+            return await Promise.all(promises);
+        })();
+    """
+  start_time = time.time()
+  print(
+      f"  🚀 Batch fetching {len(listing_ids)} full descriptions in browser"
+      " engine..."
+  )
+
+  ids_json = json.dumps(listing_ids)
+  raw_results = page.run_js(js_script, ids_json)
+  results = {}
+  if raw_results and isinstance(raw_results, list):
+    for item in raw_results:
+      if isinstance(item, dict) and item.get("id") and item.get("desc"):
+        results[str(item["id"])] = item["desc"]
+
+  elapsed = time.time() - start_time
+  print(
+      f"  ⚡ Extracted {len(results)}/{len(listing_ids)} full descriptions in"
+      f" {elapsed:.2f}s!"
+  )
+  return results
+
+
+# ==========================================
+# MAIN SCRAPER EXECUTION
+# ==========================================
 def esegui_scraping():
   init_db()
   db = get_db()
+  db_cache = load_db_cache(db)
   nuovi_totali = 0
 
-  print("🚀 Avvio DrissionPage...")
+  print("🚀 Launching DrissionPage Stealth Browser Context...")
   co = ChromiumOptions()
+  co.set_argument("--blink-settings=imagesEnabled=false")
+  co.mute(True)
+
   page = ChromiumPage(co)
 
   try:
-    print("🔗 Connessione iniziale...")
+    print("🔗 Solving Akamai & Didomi challenge natively...")
     page.get("https://www.immobiliare.it/")
     gestisci_cookie_banner(page)
-    time.sleep(2)
+    print("✅ Stealth Session Ready!")
 
     for profilo, url_ricerca in RICERCHE.items():
-      print("==================================================")
-      print(f"Scraping per profilo: {profilo}")
+      print("\n==================================================")
+      print(f"Scraping profile: {profilo}")
       print("==================================================")
 
       for pag in range(1, MAX_PAGINE + 1):
@@ -254,93 +358,65 @@ def esegui_scraping():
             else f"{url_ricerca}?pag={pag}"
         )
 
-        print(f"\n--- [Pagina {pag}/{MAX_PAGINE}] Caricamento... ---")
-        page.get(url_corrente)
-        gestisci_cookie_banner(page)
-        page.scroll.down(600)
-        time.sleep(2.5)
+        print(f"\n--- [Page {pag}/{MAX_PAGINE}] Crawling... ---")
+        start_page_time = time.time()
 
+        html_content = fetch_html_via_browser(page, url_corrente)
         annunci_pagina = {}
 
-        soup = BeautifulSoup(page.html, "html.parser")
-        next_data = soup.find("script", id="__NEXT_DATA__")
-        if next_data and next_data.string:
-          try:
-            data_json = json.loads(next_data.string)
-            risultati = cerca_annunci_nel_json(data_json)
-            for r in risultati:
-              re_obj = r.get("realEstate", r)
-              if isinstance(re_obj, dict) and "id" in re_obj:
-                annunci_pagina[str(re_obj["id"])] = re_obj
-          except Exception:
-            pass
-
-        if not annunci_pagina:
-          cards = page.eles(".in-realEstateCard") or page.eles("article")
-          for card in cards:
+        if html_content:
+          soup = BeautifulSoup(html_content, "html.parser")
+          next_data = soup.find("script", id="__NEXT_DATA__")
+          if next_data and next_data.string:
             try:
-              link_ele = card.ele('a[href*="/annunci/"]')
-              if not link_ele:
-                continue
-              link = link_ele.attr("href")
-              id_match = re.search(r"/annunci/(\d+)", link)
-              if not id_match:
-                continue
+              data_json = json.loads(next_data.string)
+              risultati = cerca_annunci_nel_json(data_json)
+              for r in risultati:
+                re_obj = r.get("realEstate", r)
+                if isinstance(re_obj, dict) and "id" in re_obj:
+                  annunci_pagina[str(re_obj["id"])] = re_obj
+            except Exception:
+              pass
 
-              id_annuncio = id_match.group(1)
-              titolo = (
-                  link_ele.attr("title")
-                  or link_ele.text
-                  or "Annuncio Immobiliare"
-              )
-
-              price_ele = card.ele(".in-realEstateCard__price") or card.ele(
-                  "text:€"
-              )
-              prezzo = price_ele.text if price_ele else "N/D"
-
-              img_eles = card.eles("img")
-              foto_list = [
-                  convert_to_hd_url(
-                      img.attr("src") or img.attr("data-src")
-                  )
-                  for img in img_eles
-                  if img.attr("src") or img.attr("data-src")
-              ]
-
-              features = [
-                  f.text for f in card.eles(".in-realEstateCard__feature")
-              ]
-              superficie, locali = "N/D", "N/D"
-              for feat in features:
-                if "m²" in feat:
-                  superficie = feat.replace("m²", "").strip()
-                elif feat.isdigit():
-                  locali = feat
-
-              desc_ele = card.ele(".in-realEstateCard__description")
-              descrizione = desc_ele.text if desc_ele else ""
-
-              annunci_pagina[id_annuncio] = {
-                  "id": id_annuncio,
-                  "title": titolo,
-                  "price": prezzo,
-                  "foto_list": foto_list,
-                  "url": format_full_url(link, id_annuncio),
-                  "properties": [{
-                      "surface": superficie,
-                      "rooms": locali,
-                      "description": descrizione,
-                  }],
-              }
+        # Fallback to direct page navigation if in-memory fetch is empty
+        if not annunci_pagina:
+          page.get(url_corrente)
+          gestisci_cookie_banner(page)
+          soup = BeautifulSoup(page.html, "html.parser")
+          next_data = soup.find("script", id="__NEXT_DATA__")
+          if next_data and next_data.string:
+            try:
+              data_json = json.loads(next_data.string)
+              risultati = cerca_annunci_nel_json(data_json)
+              for r in risultati:
+                re_obj = r.get("realEstate", r)
+                if isinstance(re_obj, dict) and "id" in re_obj:
+                  annunci_pagina[str(re_obj["id"])] = re_obj
             except Exception:
               pass
 
         if not annunci_pagina:
-          print(f"⚠️ Nessun annuncio trovato alla pagina {pag}.")
+          print(f"⚠️ No listings found on page {pag}. Stopping pagination.")
           break
 
-        print(f"✅ Estratti {len(annunci_pagina)} annunci!")
+        print(
+            f"✅ Found {len(annunci_pagina)} listings in"
+            f" {time.time() - start_page_time:.2f}s."
+        )
+
+        needs_detail_ids = []
+        for id_annuncio in annunci_pagina.keys():
+          cached_desc = db_cache.get(id_annuncio, "")
+          if (
+              not cached_desc
+              or len(cached_desc) < 150
+              or cached_desc.endswith("...")
+          ):
+            needs_detail_ids.append(id_annuncio)
+
+        fetched_descriptions = batch_fetch_descriptions_js(
+            page, needs_detail_ids
+        )
 
         nuovi_pagina = 0
         for id_annuncio, real_estate in annunci_pagina.items():
@@ -359,10 +435,6 @@ def esegui_scraping():
               properties[0]
               if isinstance(properties, list) and len(properties) > 0
               else {}
-          )
-
-          descrizione = (
-              prop.get("description") or real_estate.get("description") or ""
           )
 
           superficie_raw = (
@@ -393,21 +465,30 @@ def esegui_scraping():
             if best_url:
               foto_urls.append(convert_to_hd_url(best_url))
 
-          if not foto_urls and "foto_list" in real_estate:
-            foto_urls = [
-                convert_to_hd_url(img) for img in real_estate["foto_list"]
-            ]
-
           foto_json = json.dumps(foto_urls)
 
-          sql_check = "SELECT id FROM annunci WHERE id = ?"
+          descrizione = (
+              fetched_descriptions.get(id_annuncio)
+              or (
+                  prop.get("caption")
+                  or prop.get("description")
+                  or real_estate.get("caption")
+                  or real_estate.get("description")
+                  or ""
+              ).strip()
+              or db_cache.get(id_annuncio, "")
+          )
+
+          sql_check_exists = id_annuncio in db_cache
           sql_insert = """
                         INSERT INTO annunci 
                         (id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, descrizione, stato) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
                     """
-          sql_update_existing = """
-                        UPDATE annunci SET url = ?, foto = ?, descrizione = COALESCE(NULLIF(?, ''), descrizione) WHERE id = ?
+          sql_update = """
+                        UPDATE annunci 
+                        SET url = ?, foto = ?, descrizione = CASE WHEN ? != '' THEN ? ELSE descrizione END 
+                        WHERE id = ?
                     """
           params_insert = (
               id_annuncio,
@@ -424,44 +505,45 @@ def esegui_scraping():
           )
 
           if isinstance(db, TursoDB):
-            existing = db.execute(sql_check, [id_annuncio])
-            if existing.empty:
+            if not sql_check_exists:
               db.execute(sql_insert, params_insert)
               nuovi_totali += 1
               nuovi_pagina += 1
+              db_cache[id_annuncio] = descrizione
               print(
-                  f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)"
+                  f"   ✨ [NEW] {titolo} - {prezzo} ({len(foto_urls)} photos)"
               )
             else:
               db.execute(
-                  sql_update_existing,
-                  [link, foto_json, descrizione, id_annuncio],
+                  sql_update,
+                  [link, foto_json, descrizione, descrizione, id_annuncio],
               )
+              db_cache[id_annuncio] = descrizione
           else:
-            conn = db
+            conn = db if not isinstance(db, str) else sqlite3.connect("case.db")
             cursor = conn.cursor()
-            cursor.execute(sql_check, (id_annuncio,))
-            if not cursor.fetchone():
+            if not sql_check_exists:
               cursor.execute(sql_insert, params_insert)
               conn.commit()
               nuovi_totali += 1
               nuovi_pagina += 1
+              db_cache[id_annuncio] = descrizione
               print(
-                  f"   [NUOVO] {titolo} - {prezzo} ({len(foto_urls)} foto HD)"
+                  f"   ✨ [NEW] {titolo} - {prezzo} ({len(foto_urls)} photos)"
               )
             else:
               cursor.execute(
-                  sql_update_existing,
-                  (link, foto_json, descrizione, id_annuncio),
+                  sql_update,
+                  (link, foto_json, descrizione, descrizione, id_annuncio),
               )
               conn.commit()
 
-        print(f"   ↳ {nuovi_pagina} nuovi annunci inseriti.")
-
-    page.quit()
+        print(f"   ↳ {nuovi_pagina} new listings inserted into DB.")
 
   except Exception as e:
-    print(f"❌ Errore: {e}")
+    print(f"❌ Error during scraping run: {e}")
+  finally:
+    page.quit()
 
   return nuovi_totali
 
