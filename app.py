@@ -23,8 +23,8 @@ if "sort_dir" not in st.session_state:
 
 def get_connection():
     """Checks Streamlit secrets first, then OS environment variables, then falls back to local case.db."""
-    turso_url = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", ""))
-    turso_token = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", ""))
+    turso_url = st.secrets.get("TURSO_URL", os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io"))
+    turso_token = st.secrets.get("TURSO_TOKEN", os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODA3MTEsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.LiDuf5yxnhMHZdQ6RZiK7pbruFNMScTfNJeQ2yxT7kDms0TtKrEFR7yTTyTnqf02fDj8VTz-jUoKtXz2B3vrDQ"))
 
     if HAS_LIBSQL and turso_url and turso_token:
         return libsql.connect(database=turso_url, auth_token=turso_token)

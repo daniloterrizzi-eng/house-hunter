@@ -21,8 +21,8 @@ RICERCHE = {
 
 def get_connection():
     """Connects to Turso cloud DB if environment variables exist, else falls back to local SQLite."""
-    turso_url = os.getenv("TURSO_URL", "")
-    turso_token = os.getenv("TURSO_TOKEN", "")
+    turso_url = os.getenv("TURSO_URL", "libsql://house-hunter-daniloterrizzi-eng.aws-eu-west-1.turso.io")
+    turso_token = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODY4ODA3MTEsImlkIjoiMDFhMDBhNjAtODkwMS03MDI0LWEyMWYtNTY1OTA2YTYwNThiIiwia2lkIjoiQVl3eDdVUktWLV90SjEyUnFnNHYzYW1RVGszWnc0Z042UnR1ZFdwNWgtMCIsInJpZCI6ImU5NDFlZjAyLWU0MWYtNDJiOS05MTRhLWY5NDM5NGNiMzM5YSJ9.LiDuf5yxnhMHZdQ6RZiK7pbruFNMScTfNJeQ2yxT7kDms0TtKrEFR7yTTyTnqf02fDj8VTz-jUoKtXz2B3vrDQ")
 
     if HAS_LIBSQL and turso_url and turso_token:
         print("🌐 Connecting to Turso Cloud Database...")
