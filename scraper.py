@@ -31,7 +31,7 @@ RICERCHE = {
 
 
 # ==========================================
-# TURSO DB CLASS
+# BATCH-ENABLED TURSO DB CLASS
 # ==========================================
 class TursoDB:
 
@@ -42,7 +42,7 @@ class TursoDB:
         "Content-Type": "application/json",
     }
 
-  def execute(self, sql, params=None):
+  def _build_stmt(self, sql, params=None):
     args = []
     if params:
       for p in params:
@@ -54,14 +54,15 @@ class TursoDB:
           args.append({"type": "float", "value": p})
         else:
           args.append({"type": "text", "value": str(p)})
+    return {"sql": sql, "args": args}
 
+  def execute(self, sql, params=None):
     payload = {
         "requests": [
-            {"type": "execute", "stmt": {"sql": sql, "args": args}},
+            {"type": "execute", "stmt": self._build_stmt(sql, params)},
             {"type": "close"},
         ]
     }
-
     res = requests.post(
         self.endpoint, json=payload, headers=self.headers, timeout=15
     )
@@ -86,6 +87,27 @@ class TursoDB:
       rows.append(parsed_row)
 
     return pd.DataFrame(rows, columns=cols)
+
+  def execute_batch(self, statements: list[tuple[str, list]], chunk_size=100):
+    """Executes hundreds of SQL statements in bundled HTTP payload chunks."""
+    if not statements:
+      return
+
+    for i in range(0, len(statements), chunk_size):
+      chunk = statements[i : i + chunk_size]
+      requests_payload = [
+          {"type": "execute", "stmt": self._build_stmt(sql, params)}
+          for sql, params in chunk
+      ]
+      requests_payload.append({"type": "close"})
+
+      res = requests.post(
+          self.endpoint,
+          json={"requests": requests_payload},
+          headers=self.headers,
+          timeout=30,
+      )
+      res.raise_for_status()
 
 
 def get_db():
@@ -116,10 +138,15 @@ def init_db():
             data_scoperta TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """
+  sql_index = """
+        CREATE INDEX IF NOT EXISTS idx_annunci_stato_data 
+        ON annunci (stato, data_scoperta DESC);
+    """
   sql_alter = "ALTER TABLE annunci ADD COLUMN descrizione TEXT DEFAULT ''"
 
   if isinstance(db, TursoDB):
     db.execute(sql_create)
+    db.execute(sql_index)
     try:
       db.execute(sql_alter)
     except Exception:
@@ -128,6 +155,7 @@ def init_db():
     conn = db
     cursor = conn.cursor()
     cursor.execute(sql_create)
+    cursor.execute(sql_index)
     try:
       cursor.execute(sql_alter)
     except Exception:
@@ -249,11 +277,7 @@ def gestisci_cookie_banner(page):
     pass
 
 
-# ==========================================
-# BROWSER IN-MEMORY FETCH ENGINE
-# ==========================================
 def fetch_html_via_browser(page, url: str) -> str:
-  """Executes fetch() natively within Chromium page context to bypass Akamai."""
   js_script = r"""
         return (async () => {
             try {
@@ -270,7 +294,6 @@ def fetch_html_via_browser(page, url: str) -> str:
 
 
 def batch_fetch_descriptions_js(page, listing_ids: list) -> dict:
-  """Concurrently fetches missing listing descriptions inside the Chromium browser console."""
   if not listing_ids:
     return {}
 
@@ -331,7 +354,6 @@ def esegui_scraping():
   init_db()
   db = get_db()
   db_cache = load_db_cache(db)
-  nuovi_totali = 0
 
   print("🚀 Launching DrissionPage Stealth Browser Context...")
   co = ChromiumOptions()
@@ -339,13 +361,15 @@ def esegui_scraping():
   co.mute(True)
 
   page = ChromiumPage(co)
+  all_scraped_listings = {}
 
   try:
-    print("🔗 Solving Akamai & Didomi challenge natively...")
+    print("🔗 Solving Anti-Bot challenge natively...")
     page.get("https://www.immobiliare.it/")
     gestisci_cookie_banner(page)
     print("✅ Stealth Session Ready!")
 
+    # STEP 1: Crawl all pages into memory
     for profilo, url_ricerca in RICERCHE.items():
       print("\n==================================================")
       print(f"Scraping profile: {profilo}")
@@ -358,7 +382,7 @@ def esegui_scraping():
             else f"{url_ricerca}?pag={pag}"
         )
 
-        print(f"\n--- [Page {pag}/{MAX_PAGINE}] Crawling... ---")
+        print(f"--- [Page {pag}/{MAX_PAGINE}] Crawling... ---")
         start_page_time = time.time()
 
         html_content = fetch_html_via_browser(page, url_corrente)
@@ -374,24 +398,7 @@ def esegui_scraping():
               for r in risultati:
                 re_obj = r.get("realEstate", r)
                 if isinstance(re_obj, dict) and "id" in re_obj:
-                  annunci_pagina[str(re_obj["id"])] = re_obj
-            except Exception:
-              pass
-
-        # Fallback to direct page navigation if in-memory fetch is empty
-        if not annunci_pagina:
-          page.get(url_corrente)
-          gestisci_cookie_banner(page)
-          soup = BeautifulSoup(page.html, "html.parser")
-          next_data = soup.find("script", id="__NEXT_DATA__")
-          if next_data and next_data.string:
-            try:
-              data_json = json.loads(next_data.string)
-              risultati = cerca_annunci_nel_json(data_json)
-              for r in risultati:
-                re_obj = r.get("realEstate", r)
-                if isinstance(re_obj, dict) and "id" in re_obj:
-                  annunci_pagina[str(re_obj["id"])] = re_obj
+                  annunci_pagina[str(re_obj["id"])] = (re_obj, profilo)
             except Exception:
               pass
 
@@ -403,149 +410,156 @@ def esegui_scraping():
             f"✅ Found {len(annunci_pagina)} listings in"
             f" {time.time() - start_page_time:.2f}s."
         )
+        all_scraped_listings.update(annunci_pagina)
 
-        needs_detail_ids = []
-        for id_annuncio in annunci_pagina.keys():
-          cached_desc = db_cache.get(id_annuncio, "")
-          if (
-              not cached_desc
-              or len(cached_desc) < 150
-              or cached_desc.endswith("...")
-          ):
-            needs_detail_ids.append(id_annuncio)
+    print(
+        f"\n🎯 Total unique listings gathered in RAM:"
+        f" {len(all_scraped_listings)}"
+    )
 
-        fetched_descriptions = batch_fetch_descriptions_js(
-            page, needs_detail_ids
+    # STEP 2: Batch fetch missing descriptions across all gathered items
+    needs_detail_ids = []
+    for id_annuncio in all_scraped_listings.keys():
+      cached_desc = db_cache.get(id_annuncio, "")
+      if (
+          not cached_desc
+          or len(cached_desc) < 150
+          or cached_desc.endswith("...")
+      ):
+        needs_detail_ids.append(id_annuncio)
+
+    fetched_descriptions = batch_fetch_descriptions_js(page, needs_detail_ids)
+
+    # STEP 3: Unified UPSERT logic for DB protection
+    sql_upsert = """
+        INSERT INTO annunci (
+            id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, descrizione, stato
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
+        ON CONFLICT(id) DO UPDATE SET
+            profilo        = excluded.profilo,
+            titolo         = excluded.titolo,
+            prezzo         = excluded.prezzo,
+            prezzo_num     = excluded.prezzo_num,
+            superficie     = excluded.superficie,
+            superficie_num = excluded.superficie_num,
+            locali         = excluded.locali,
+            url            = excluded.url,
+            foto           = excluded.foto,
+            descrizione    = CASE 
+                                WHEN length(excluded.descrizione) > length(annunci.descrizione) THEN excluded.descrizione 
+                                ELSE annunci.descrizione 
+                             END;
+    """
+
+    sql_batch = []
+    new_count = 0
+    updated_count = 0
+
+    for id_annuncio, (real_estate, profilo) in all_scraped_listings.items():
+      titolo = real_estate.get("title", "N/D")
+
+      price_data = real_estate.get("price", {})
+      prezzo = (
+          f"{price_data.get('value', 'N/D')} €"
+          if isinstance(price_data, dict)
+          else str(price_data)
+      )
+      prezzo_num = parse_digits(prezzo)
+
+      properties = real_estate.get("properties", [{}])
+      prop = (
+          properties[0]
+          if isinstance(properties, list) and len(properties) > 0
+          else {}
+      )
+
+      superficie_raw = str(prop.get("surface", "N/D")).replace("m²", "").strip()
+      superficie_num = parse_digits(superficie_raw)
+      superficie = f"{superficie_num}" if superficie_num > 0 else "N/D"
+
+      locali = str(prop.get("rooms", "N/D"))
+      link = extract_listing_url(real_estate, id_annuncio)
+
+      foto_urls = []
+      multimedia = prop.get("multimedia", {})
+      photos = (
+          multimedia.get("photos", []) if isinstance(multimedia, dict) else []
+      )
+
+      for p in photos:
+        urls_dict = p.get("urls", {})
+        best_url = (
+            urls_dict.get("extra_large")
+            or urls_dict.get("large")
+            or urls_dict.get("medium")
+            or urls_dict.get("small")
         )
+        if best_url:
+          foto_urls.append(convert_to_hd_url(best_url))
 
-        nuovi_pagina = 0
-        for id_annuncio, real_estate in annunci_pagina.items():
-          titolo = real_estate.get("title", "N/D")
+      foto_json = json.dumps(foto_urls)
 
-          price_data = real_estate.get("price", {})
-          prezzo = (
-              f"{price_data.get('value', 'N/D')} €"
-              if isinstance(price_data, dict)
-              else str(price_data)
-          )
-          prezzo_num = parse_digits(prezzo)
+      descrizione = (
+          fetched_descriptions.get(id_annuncio)
+          or (
+              prop.get("caption")
+              or prop.get("description")
+              or real_estate.get("caption")
+              or real_estate.get("description")
+              or ""
+          ).strip()
+          or db_cache.get(id_annuncio, "")
+      )
 
-          properties = real_estate.get("properties", [{}])
-          prop = (
-              properties[0]
-              if isinstance(properties, list) and len(properties) > 0
-              else {}
-          )
+      cached_desc = db_cache.get(id_annuncio)
 
-          superficie_raw = (
-              str(prop.get("surface", "N/D")).replace("m²", "").strip()
-          )
-          superficie_num = parse_digits(superficie_raw)
-          superficie = f"{superficie_num}" if superficie_num > 0 else "N/D"
+      if cached_desc is None:
+        new_count += 1
+        print(f"   ✨ [NEW] {titolo} - {prezzo} ({len(foto_urls)} photos)")
+      else:
+        updated_count += 1
 
-          locali = str(prop.get("rooms", "N/D"))
-          link = extract_listing_url(real_estate, id_annuncio)
+      params = (
+          id_annuncio,
+          profilo,
+          titolo,
+          prezzo,
+          prezzo_num,
+          superficie,
+          superficie_num,
+          locali,
+          link,
+          foto_json,
+          descrizione,
+      )
+      sql_batch.append((sql_upsert, params))
 
-          foto_urls = []
-          multimedia = prop.get("multimedia", {})
-          photos = (
-              multimedia.get("photos", [])
-              if isinstance(multimedia, dict)
-              else []
-          )
+    # STEP 4: Flush all DB operations in a single fast batch pipeline call
+    print(
+        f"\n💾 Flushing {len(sql_batch)} database operations ({new_count} new,"
+        f" {updated_count} checked/updated)..."
+    )
+    start_db_time = time.time()
 
-          for p in photos:
-            urls_dict = p.get("urls", {})
-            best_url = (
-                urls_dict.get("extra_large")
-                or urls_dict.get("large")
-                or urls_dict.get("medium")
-                or urls_dict.get("small")
-            )
-            if best_url:
-              foto_urls.append(convert_to_hd_url(best_url))
+    if isinstance(db, TursoDB):
+      db.execute_batch(sql_batch)
+    else:
+      conn = db if not isinstance(db, str) else sqlite3.connect("case.db")
+      cursor = conn.cursor()
+      for sql, params in sql_batch:
+        cursor.execute(sql, params)
+      conn.commit()
+      conn.close()
 
-          foto_json = json.dumps(foto_urls)
-
-          descrizione = (
-              fetched_descriptions.get(id_annuncio)
-              or (
-                  prop.get("caption")
-                  or prop.get("description")
-                  or real_estate.get("caption")
-                  or real_estate.get("description")
-                  or ""
-              ).strip()
-              or db_cache.get(id_annuncio, "")
-          )
-
-          sql_check_exists = id_annuncio in db_cache
-          sql_insert = """
-                        INSERT INTO annunci 
-                        (id, profilo, titolo, prezzo, prezzo_num, superficie, superficie_num, locali, url, foto, descrizione, stato) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in review')
-                    """
-          sql_update = """
-                        UPDATE annunci 
-                        SET url = ?, foto = ?, descrizione = CASE WHEN ? != '' THEN ? ELSE descrizione END 
-                        WHERE id = ?
-                    """
-          params_insert = (
-              id_annuncio,
-              profilo,
-              titolo,
-              prezzo,
-              prezzo_num,
-              superficie,
-              superficie_num,
-              locali,
-              link,
-              foto_json,
-              descrizione,
-          )
-
-          if isinstance(db, TursoDB):
-            if not sql_check_exists:
-              db.execute(sql_insert, params_insert)
-              nuovi_totali += 1
-              nuovi_pagina += 1
-              db_cache[id_annuncio] = descrizione
-              print(
-                  f"   ✨ [NEW] {titolo} - {prezzo} ({len(foto_urls)} photos)"
-              )
-            else:
-              db.execute(
-                  sql_update,
-                  [link, foto_json, descrizione, descrizione, id_annuncio],
-              )
-              db_cache[id_annuncio] = descrizione
-          else:
-            conn = db if not isinstance(db, str) else sqlite3.connect("case.db")
-            cursor = conn.cursor()
-            if not sql_check_exists:
-              cursor.execute(sql_insert, params_insert)
-              conn.commit()
-              nuovi_totali += 1
-              nuovi_pagina += 1
-              db_cache[id_annuncio] = descrizione
-              print(
-                  f"   ✨ [NEW] {titolo} - {prezzo} ({len(foto_urls)} photos)"
-              )
-            else:
-              cursor.execute(
-                  sql_update,
-                  (link, foto_json, descrizione, descrizione, id_annuncio),
-              )
-              conn.commit()
-
-        print(f"   ↳ {nuovi_pagina} new listings inserted into DB.")
+    print(
+        f"⚡ Database sync complete in {time.time() - start_db_time:.2f}s!"
+    )
+    return new_count
 
   except Exception as e:
     print(f"❌ Error during scraping run: {e}")
   finally:
     page.quit()
-
-  return nuovi_totali
 
 
 if __name__ == "__main__":

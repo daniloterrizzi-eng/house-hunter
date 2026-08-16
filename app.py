@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+import urllib.parse
 import pandas as pd
 import requests
 import streamlit as st
@@ -92,7 +93,9 @@ def get_db():
   return sqlite3.connect("case.db", check_same_thread=False)
 
 
-def read_query_df(query, params=None):
+@st.cache_data(ttl=30)
+def read_query_df(query, params_tuple=None):
+  params = list(params_tuple) if params_tuple else None
   db = get_db()
   if isinstance(db, TursoDB):
     return db.execute(query, params)
@@ -119,6 +122,7 @@ def execute_query(query, params=None):
     cursor.execute(query, params or ())
     conn.commit()
     conn.close()
+  st.cache_data.clear()  # Invalidate cache on mutations
 
 
 def init_db():
@@ -168,22 +172,18 @@ def format_full_url(url: str, listing_id: str = "") -> str:
 
 
 def convert_to_hd_url(url: str) -> str:
-  """Converts thumbnail and broken URLs dynamically to high-res '/l-c.jpg'."""
   if not url:
     return url
   clean_url = url.split("?")[0]
-
   clean_url = re.sub(
       r"/(\d+x\d+|xxs|xs|s|m|l|xl)(-c)?\.(jpg|jpeg|webp|png)$",
       r"/l-c.\3",
       clean_url,
       flags=re.IGNORECASE,
   )
-
   clean_url = re.sub(r"/thumbnails?/", "/images/", clean_url)
   clean_url = re.sub(r"-thumb\.", "-large.", clean_url)
   clean_url = re.sub(r"/small/", "/large/", clean_url)
-
   return clean_url
 
 
@@ -193,6 +193,11 @@ def batch_update_listing(id_annuncio, voto_danilo, voto_aurelia, stato, note):
       " = ? WHERE id = ?"
   )
   execute_query(sql, [voto_danilo, voto_aurelia, stato, note, id_annuncio])
+
+
+def update_status_only(id_annuncio, stato):
+  sql = "UPDATE annunci SET stato = ? WHERE id = ?"
+  execute_query(sql, [stato, id_annuncio])
 
 
 def toggle_sort(column_db_name):
@@ -208,7 +213,7 @@ def toggle_sort(column_db_name):
 @st.dialog("🏠 Dettaglio Casa", width="large")
 def mostra_modal_dettaglio(item_id):
   df_single = read_query_df(
-      "SELECT * FROM annunci WHERE id = ?", params=[item_id]
+      "SELECT * FROM annunci WHERE id = ?", params_tuple=(item_id,)
   )
 
   if df_single.empty:
@@ -268,47 +273,20 @@ def mostra_modal_dettaglio(item_id):
       )
 
     st.image(foto_list[st.session_state[img_key]], use_container_width=True)
-
-    st.components.v1.html(
-        f"""
-            <div style="display:none;">
-            <script>
-            const topWin = window.top;
-            const topDoc = topWin.document;
-
-            function onKey(e) {{
-                if (e.key === 'ArrowLeft') {{
-                    const btnPrev = topDoc.querySelector('button[key="btn_p_{item['id']}"]');
-                    if (btnPrev) {{
-                        e.preventDefault();
-                        btnPrev.click();
-                    }}
-                }} else if (e.key === 'ArrowRight') {{
-                    const btnNext = topDoc.querySelector('button[key="btn_n_{item['id']}"]');
-                    if (btnNext) {{
-                        e.preventDefault();
-                        btnNext.click();
-                    }}
-                }}
-            }}
-
-            topWin.removeEventListener('keydown', topWin._stKeyHandler);
-            topWin._stKeyHandler = onKey;
-            topWin.addEventListener('keydown', topWin._stKeyHandler);
-            topWin.focus();
-            </script>
-            </div>
-            """,
-        height=0,
-    )
   else:
     st.info("📷 Nessuna foto disponibile per questo annuncio.")
 
   st.markdown(f"🔗 **[Apri scheda originale su Immobiliare.it]({item_url})**")
 
+  # --- EMBEDDED MAP VIEW ---
+  st.markdown("### 📍 Posizione")
+  query_address = urllib.parse.quote(f"{item['titolo']}, Torino")
+  map_url = f"https://maps.google.com/maps?q={query_address}&output=embed"
+  st.components.v1.iframe(map_url, height=280, scrolling=False)
+
   desc_text = item.get("descrizione")
   if desc_text and str(desc_text).strip():
-    with st.expander("📖 Descrizione Completa", expanded=True):
+    with st.expander("📖 Descrizione Completa", expanded=False):
       st.write(desc_text)
 
   st.divider()
@@ -360,6 +338,7 @@ def mostra_modal_dettaglio(item_id):
   ):
     batch_update_listing(item["id"], voto_d, voto_a, new_status, note_input)
     st.toast("✅ Modifiche salvate!")
+    st.rerun()
 
 
 # --- SIDEBAR FILTERS ---
@@ -379,7 +358,6 @@ if show_status:
     query_stati.append("nuovo")
 
   placeholders = ",".join(["?"] * len(query_stati))
-
   sort_column = st.session_state.sort_col
   sort_direction = st.session_state.sort_dir
 
@@ -388,7 +366,7 @@ if show_status:
         WHERE stato IN ({placeholders})
         ORDER BY {sort_column} {sort_direction}
     """
-  df = read_query_df(query, params=query_stati)
+  df = read_query_df(query, params_tuple=tuple(query_stati))
 else:
   df = pd.DataFrame()
 
@@ -400,17 +378,34 @@ if not df.empty:
     df = df[df["titolo"].str.contains(search_term, case=False, na=False)]
 
 # --- SCHERMATA PRINCIPALE ---
-st.title(f"🏠 House Hunter Turin ({len(df)} immobili)")
+st.title("🏠 House Hunter Turin")
+
+# --- METRICS SUMMARY BAR ---
+if not df.empty:
+  m1, m2, m3, m4, m5 = st.columns(5)
+  m1.metric("Totale Filtrati", len(df))
+  m2.metric(
+      "In Review", len(df[df["stato"] == "in review"])
+  )
+  m3.metric("Saved", len(df[df["stato"] == "saved"]))
+  m4.metric("Maybe", len(df[df["stato"] == "maybe"]))
+  avg_price = (
+      int(df["prezzo_num"].mean())
+      if not df.empty and df["prezzo_num"].max() > 0
+      else 0
+  )
+  m5.metric("Prezzo Medio", f"€ {avg_price:,.0f}")
+  st.divider()
 
 if df.empty:
   st.info("💡 Nessun immobile trovato. Modifica i filtri o esegui lo scraper!")
 else:
   st.caption(
-      "👇 Clicca sulle intestazioni per ordinare. Clicca sul **Titolo** per"
-      " aprire la scheda originale su Immobiliare.it."
+      "👇 Clicca sulle intestazioni per ordinare. Modifica lo **Stato**"
+      " direttamente dal menu a tendina in tabella."
   )
 
-  h_cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
+  h_cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.5, 1, 1, 1])
   arrow = "🔽" if st.session_state.sort_dir == "DESC" else "🔼"
 
   if h_cols[0].button(
@@ -478,7 +473,7 @@ else:
 
   for idx, item in df_page.iterrows():
     with st.container(border=True):
-      cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.2, 1, 1, 1])
+      cols = st.columns([3.5, 1.5, 1.2, 0.8, 1.5, 1, 1, 1])
 
       item_url = format_full_url(item["url"], item["id"])
       cols[0].markdown(f"🔗 [{item['titolo']}]({item_url})")
@@ -490,14 +485,21 @@ else:
 
       cols[3].write(item["locali"])
 
-      status_colors = {
-          "in review": "🔵",
-          "saved": "🟢",
-          "maybe": "🟡",
-          "discarded": "🔴",
-      }
-      badge = f"{status_colors.get(item['stato'], '⚪')} {item['stato']}"
-      cols[4].write(badge)
+      # --- INLINE STATUS SELECTBOX ---
+      curr_status = (
+          item["stato"] if item["stato"] in STATI_DISPONIBILI else "in review"
+      )
+      new_inline_status = cols[4].selectbox(
+          "Stato",
+          STATI_DISPONIBILI,
+          index=STATI_DISPONIBILI.index(curr_status),
+          key=f"inline_st_{item['id']}",
+          label_visibility="collapsed",
+      )
+      if new_inline_status != curr_status:
+        update_status_only(item["id"], new_inline_status)
+        st.toast(f"🔄 Stato aggiornato a: {new_inline_status}")
+        st.rerun()
 
       cols[5].write(f"⭐ {item['voto_danilo']}" if item["voto_danilo"] else "-")
       cols[6].write(
