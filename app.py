@@ -273,6 +273,45 @@ def mostra_modal_dettaglio(item_id):
       )
 
     st.image(foto_list[st.session_state[img_key]], use_container_width=True)
+
+    # --- KEYBOARD SHORTCUT LISTENER (LEFT / RIGHT ARROWS) ---
+    st.components.v1.html(
+        """
+            <div style="display:none;">
+            <script>
+            const topWin = window.top;
+            const topDoc = topWin.document;
+
+            function onKey(e) {
+                // Ignore if user is typing in an input/textarea/select
+                if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+
+                if (e.key === 'ArrowLeft') {
+                    const buttons = Array.from(topDoc.querySelectorAll('button'));
+                    const btnPrev = buttons.find(b => b.innerText.includes('Precedente'));
+                    if (btnPrev) {
+                        e.preventDefault();
+                        btnPrev.click();
+                    }
+                } else if (e.key === 'ArrowRight') {
+                    const buttons = Array.from(topDoc.querySelectorAll('button'));
+                    const btnNext = buttons.find(b => b.innerText.includes('Successiva'));
+                    if (btnNext) {
+                        e.preventDefault();
+                        btnNext.click();
+                    }
+                }
+            }
+
+            topWin.removeEventListener('keydown', topWin._stKeyHandler);
+            topWin._stKeyHandler = onKey;
+            topWin.addEventListener('keydown', topWin._stKeyHandler);
+            topWin.focus();
+            </script>
+            </div>
+            """,
+        height=0,
+    )
   else:
     st.info("📷 Nessuna foto disponibile per questo annuncio.")
 
@@ -384,9 +423,7 @@ st.title("🏠 House Hunter Turin")
 if not df.empty:
   m1, m2, m3, m4, m5 = st.columns(5)
   m1.metric("Totale Filtrati", len(df))
-  m2.metric(
-      "In Review", len(df[df["stato"] == "in review"])
-  )
+  m2.metric("In Review", len(df[df["stato"] == "in review"]))
   m3.metric("Saved", len(df[df["stato"] == "saved"]))
   m4.metric("Maybe", len(df[df["stato"] == "maybe"]))
   avg_price = (
