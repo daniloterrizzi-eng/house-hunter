@@ -225,6 +225,27 @@ def mostra_modal_dettaglio(item_id):
 
   st.subheader(item["titolo"])
 
+  # --- ALL DATABASE FIELDS MAPPING SPECIFIC PANEL ---
+  with st.container(border=True):
+    st.markdown("##### 📋 Dettagli Database Immobile")
+    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+    col_d1.metric(
+        "Prezzo",
+        item["prezzo"] if item["prezzo"] else f"€ {item['prezzo_num']}",
+    )
+    col_d2.metric(
+        "Superficie",
+        item["superficie"] if item["superficie"] else f"{item['superficie_num']} m²",
+    )
+    col_d3.metric("Locali", item["locali"] if item["locali"] else "-")
+    col_d4.metric("Profilo", item["profilo"] if item["profilo"] else "-")
+
+    st.caption(
+        f"🆔 **ID Annuncio:** `{item['id']}` &nbsp;|&nbsp; 📅 **Data"
+        f" Scoperta:** `{item['data_scoperta']}` &nbsp;|&nbsp; 🔗"
+        f" **URL DB:** `{item['url']}`"
+    )
+
   foto_raw = item.get("foto", "[]")
   foto_list = []
   try:
